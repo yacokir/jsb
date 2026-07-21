@@ -98,3 +98,15 @@ O Stage 01 será considerado concluído quando o programa for capaz de:
 - encerrar normalmente sem enviar qualquer ordem.
 
 ---
+
+## Implementação validada
+
+- preflight REST para conta Paper, relógio do mercado, ativo e Market Data;
+- WebSocket nativo do Node.js conectado ao endpoint IEX da Alpaca;
+- autenticação e assinatura de trades e quotes confirmadas explicitamente;
+- observação do stream durante 30 segundos, sem polling;
+- nenhuma ordem enviada.
+
+O código 1006 somente é aceito quando o encerramento é iniciado localmente após a conclusão integral da observação, sem erro ou falha anterior e depois de conexão, autenticação e assinaturas confirmadas. Um código 1006 espontâneo ou prematuro continua sendo falha.
+
+---
