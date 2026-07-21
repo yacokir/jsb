@@ -6,6 +6,14 @@ const DATA_FEED = "iex";
 const REQUEST_TIMEOUT_MS = 10_000;
 const STREAM_DURATION_MS = 30_000;
 const STREAM_CONNECT_TIMEOUT_MS = 10_000;
+const CONNECTION_TEST_MODE = process.env.JSB_CONNECTION_TEST === "true";
+const REFERENCE_TEST_MODE = process.env.JSB_REFERENCE_TEST === "true";
+const REFERENCE_TEST_DURATION_MS = 60_000;
+const SIMULATED_OPEN_DELAY_MS = 5_000;
+const REFERENCE_TIMEOUT_AFTER_OPEN_MS = 5 * 60_000;
+const MARKET_TIME_ZONE = "America/New_York";
+const REGULAR_MARKET_OPEN_MINUTES = 9 * 60 + 30;
+const REGULAR_MARKET_CLOSE_MINUTES = 16 * 60;
 
 const TRADING_API_BASE = "https://paper-api.alpaca.markets";
 const MARKET_DATA_API_BASE = "https://data.alpaca.markets";
@@ -133,6 +141,8 @@ async function runRestPreflight() {
 
   console.log("No orders sent.");
   console.log("Preflight completed successfully.\n");
+
+  return clock;
 }
 
 async function messageDataToText(data) {
@@ -153,6 +163,214 @@ async function messageDataToText(data) {
   }
 
   throw new Error("unsupported WebSocket message format");
+}
+
+function getMarketTime(timestamp) {
+  const date = new Date(timestamp);
+
+  if (Number.isNaN(date.getTime())) {
+    return null;
+  }
+
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: MARKET_TIME_ZONE,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    hourCycle: "h23",
+  }).formatToParts(date);
+  const values = Object.fromEntries(
+    parts.filter((part) => part.type !== "literal").map((part) => [part.type, part.value]),
+  );
+
+  return {
+    dateKey: `${values.year}-${values.month}-${values.day}`,
+    minutes: Number(values.hour) * 60 + Number(values.minute),
+    epochMs: date.getTime(),
+  };
+}
+
+function captureReferenceTrade(message, state) {
+  const price = Number(message.p);
+  const marketTime = getMarketTime(message.t);
+
+  if (message.S !== SYMBOL || !Number.isFinite(price) || price <= 0 || !marketTime) {
+    console.log("Reference price capture: ignored an invalid trade.");
+    return false;
+  }
+
+  if (
+    marketTime.minutes < REGULAR_MARKET_OPEN_MINUTES &&
+    !state.firstRegularTrade &&
+    (!state.lastPremarketTrade || marketTime.epochMs >= state.lastPremarketTrade.epochMs)
+  ) {
+    state.lastPremarketTrade = {
+      price,
+      timestamp: message.t,
+      dateKey: marketTime.dateKey,
+      epochMs: marketTime.epochMs,
+    };
+    return false;
+  }
+
+  if (
+    marketTime.minutes >= REGULAR_MARKET_OPEN_MINUTES &&
+    marketTime.minutes < REGULAR_MARKET_CLOSE_MINUTES &&
+    !state.firstRegularTrade
+  ) {
+    state.firstRegularTrade = {
+      price,
+      timestamp: message.t,
+      dateKey: marketTime.dateKey,
+    };
+
+    console.log("\nStage 02 — First regular market trade");
+    console.log(`First regular price: ${price}`);
+    console.log(`First regular timestamp: ${message.t}`);
+
+    if (
+      state.lastPremarketTrade &&
+      state.lastPremarketTrade.dateKey === state.firstRegularTrade.dateKey
+    ) {
+      state.referencePrice = (state.lastPremarketTrade.price + price) / 2;
+      console.log(`Last premarket price: ${state.lastPremarketTrade.price}`);
+      console.log(`Last premarket timestamp: ${state.lastPremarketTrade.timestamp}`);
+      console.log(`Reference price: ${state.referencePrice}`);
+      return true;
+    } else {
+      console.log("Reference price pending: no premarket trade was captured for this date.");
+    }
+  }
+
+  return false;
+}
+
+function captureSimulatedReferenceTrade(message, state) {
+  const price = Number(message.p);
+  const timestampMs = new Date(message.t).getTime();
+
+  if (
+    message.S !== SYMBOL ||
+    !Number.isFinite(price) ||
+    price <= 0 ||
+    !Number.isFinite(timestampMs)
+  ) {
+    console.log("Reference test: ignored an invalid trade.");
+    return false;
+  }
+
+  if (state.referenceTestBaseTimestamp === null) {
+    state.referenceTestBaseTimestamp = message.t;
+    state.referenceTestOpenMs = timestampMs + SIMULATED_OPEN_DELAY_MS;
+    state.referenceTestOpenTimestamp = new Date(state.referenceTestOpenMs).toISOString();
+    state.lastPremarketTrade = {
+      price,
+      timestamp: message.t,
+      epochMs: timestampMs,
+    };
+    console.log("\nStage 02 reference test: first real trade received");
+    console.log(`Base trade timestamp: ${state.referenceTestBaseTimestamp}`);
+    console.log(`Simulated open timestamp: ${state.referenceTestOpenTimestamp}`);
+    return false;
+  }
+
+  if (timestampMs < state.referenceTestOpenMs) {
+    if (timestampMs >= state.lastPremarketTrade.epochMs) {
+      state.lastPremarketTrade = {
+        price,
+        timestamp: message.t,
+        epochMs: timestampMs,
+      };
+    }
+    return false;
+  }
+
+  if (!state.firstRegularTrade) {
+    state.firstRegularTrade = {
+      price,
+      timestamp: message.t,
+    };
+    state.referencePrice = (state.lastPremarketTrade.price + price) / 2;
+
+    console.log("\nStage 02 reference test: simulated transition captured");
+    console.log(`Base trade timestamp: ${state.referenceTestBaseTimestamp}`);
+    console.log(`Simulated open timestamp: ${state.referenceTestOpenTimestamp}`);
+    console.log(`Last simulated premarket price: ${state.lastPremarketTrade.price}`);
+    console.log(
+      `Last simulated premarket timestamp: ${state.lastPremarketTrade.timestamp}`,
+    );
+    console.log(`First simulated regular price: ${state.firstRegularTrade.price}`);
+    console.log(
+      `First simulated regular timestamp: ${state.firstRegularTrade.timestamp}`,
+    );
+    console.log(
+      `Reference calculation: (${state.lastPremarketTrade.price} + ${state.firstRegularTrade.price}) / 2 = ${state.referencePrice}`,
+    );
+    return true;
+  }
+
+  return false;
+}
+
+function getReferenceTimeoutDelay(clock) {
+  const regularOpenMs = clock.is_open
+    ? new Date(clock.next_close).getTime() -
+      (REGULAR_MARKET_CLOSE_MINUTES - REGULAR_MARKET_OPEN_MINUTES) * 60_000
+    : new Date(clock.next_open).getTime();
+
+  if (!Number.isFinite(regularOpenMs)) {
+    throw new Error("Stage 02: Alpaca market clock returned an invalid session boundary.");
+  }
+
+  return Math.max(0, regularOpenMs + REFERENCE_TIMEOUT_AFTER_OPEN_MS - Date.now());
+}
+
+function printReferencePriceSummary(state) {
+  console.log("\nJSB — Stage 02 Reference Price\n");
+  console.log(`Symbol: ${SYMBOL}`);
+  console.log(`Feed: ${DATA_FEED.toUpperCase()}`);
+  console.log(`Timestamp time zone: ${MARKET_TIME_ZONE}`);
+
+  if (REFERENCE_TEST_MODE) {
+    console.log("Mode: real-trade simulated-open validation");
+    console.log(
+      `Base trade timestamp: ${state.referenceTestBaseTimestamp ?? "not observed"}`,
+    );
+    console.log(
+      `Simulated open timestamp: ${state.referenceTestOpenTimestamp ?? "not established"}`,
+    );
+    console.log(
+      `Last simulated premarket price: ${state.lastPremarketTrade?.price ?? "not observed"}`,
+    );
+    console.log(
+      `Last simulated premarket timestamp: ${state.lastPremarketTrade?.timestamp ?? "not observed"}`,
+    );
+    console.log(
+      `First simulated regular price: ${state.firstRegularTrade?.price ?? "not observed"}`,
+    );
+    console.log(
+      `First simulated regular timestamp: ${state.firstRegularTrade?.timestamp ?? "not observed"}`,
+    );
+    console.log(`Reference price: ${state.referencePrice ?? "pending"}`);
+    return;
+  }
+
+  console.log(
+    `Last premarket price: ${state.lastPremarketTrade?.price ?? "not observed"}`,
+  );
+  console.log(
+    `Last premarket timestamp: ${state.lastPremarketTrade?.timestamp ?? "not observed"}`,
+  );
+  console.log(
+    `First regular price: ${state.firstRegularTrade?.price ?? "not observed"}`,
+  );
+  console.log(
+    `First regular timestamp: ${state.firstRegularTrade?.timestamp ?? "not observed"}`,
+  );
+  console.log(`Reference price: ${state.referencePrice ?? "pending"}`);
+  console.log("IEX scope: reference inputs are limited to trades observed on IEX.");
 }
 
 function printStreamSummary(state) {
@@ -189,6 +407,8 @@ function printStreamSummary(state) {
   console.log(`Trade data received: ${state.trades > 0 ? "yes" : "no"}`);
   console.log(`Quote data received: ${state.quotes > 0 ? "yes" : "no"}`);
   console.log(`Infrastructure validated: ${infrastructureApproved ? "yes" : "no"}\n`);
+  printReferencePriceSummary(state);
+  console.log();
   console.log("No orders sent.");
 
   if (infrastructureApproved) {
@@ -242,7 +462,7 @@ function classifyClose(state) {
   return "local close after an incomplete or failed stream";
 }
 
-function runMarketDataStream() {
+function runMarketDataStream(clock) {
   return new Promise((resolve, reject) => {
     const state = {
       connected: false,
@@ -265,6 +485,12 @@ function runMarketDataStream() {
       closeEventReceived: false,
       closeEventAt: null,
       webSocketErrorOccurred: false,
+      lastPremarketTrade: null,
+      firstRegularTrade: null,
+      referencePrice: null,
+      referenceTestBaseTimestamp: null,
+      referenceTestOpenMs: null,
+      referenceTestOpenTimestamp: null,
       failure: null,
     };
 
@@ -431,20 +657,65 @@ function runMarketDataStream() {
         clearTimeout(phaseTimer);
         console.log("WebSocket trades subscription: confirmed");
         console.log("WebSocket quotes subscription: confirmed");
-        console.log(`Observing the stream for ${STREAM_DURATION_MS / 1000} seconds...\n`);
         state.observationStartedAt = Date.now();
-        observationTimer = setTimeout(() => {
-          state.observationCompleted = true;
-          closeStream("observation complete");
-        }, STREAM_DURATION_MS);
+
+        if (CONNECTION_TEST_MODE) {
+          console.log(
+            `Connection test: observing for ${STREAM_DURATION_MS / 1000} seconds...\n`,
+          );
+          observationTimer = setTimeout(() => {
+            state.observationCompleted = true;
+            closeStream("observation complete");
+          }, STREAM_DURATION_MS);
+        } else if (REFERENCE_TEST_MODE) {
+          console.log(
+            `Reference test: waiting up to ${REFERENCE_TEST_DURATION_MS / 1000} seconds for real trades around a simulated open.\n`,
+          );
+          observationTimer = setTimeout(() => {
+            const missing = [];
+            if (!state.referenceTestBaseTimestamp) {
+              missing.push("first valid trade and base timestamp");
+            }
+            if (!state.firstRegularTrade) {
+              missing.push("first trade at or after the simulated open");
+            }
+            failStream(
+              `Stage 02 reference test timeout: missing ${missing.join(" and ")}.`,
+            );
+          }, REFERENCE_TEST_DURATION_MS);
+        } else {
+          const timeoutDelay = getReferenceTimeoutDelay(clock);
+          console.log(
+            `Stage 02: waiting for the premarket/regular transition; timeout is ${REFERENCE_TIMEOUT_AFTER_OPEN_MS / 60_000} minutes after 09:30 ET.\n`,
+          );
+          observationTimer = setTimeout(() => {
+            const missing = [];
+            if (!state.lastPremarketTrade) {
+              missing.push("last valid premarket trade");
+            }
+            if (!state.firstRegularTrade) {
+              missing.push("first regular trade");
+            }
+            failStream(
+              `Stage 02 reference price timeout: missing ${missing.join(" and ") || "same-date reference inputs"}.`,
+            );
+          }, timeoutDelay);
+        }
         return;
       }
 
       if (message.T === "t") {
         state.trades += 1;
-        console.log(
-          `Trade #${state.trades} | ${message.S} | Price: ${message.p} | Size: ${message.s} | Time: ${message.t}`,
-        );
+        const referenceCalculated = CONNECTION_TEST_MODE
+          ? false
+          : REFERENCE_TEST_MODE
+            ? captureSimulatedReferenceTrade(message, state)
+            : captureReferenceTrade(message, state);
+
+        if (referenceCalculated) {
+          state.observationCompleted = true;
+          closeStream("observation complete");
+        }
         return;
       }
 
@@ -472,6 +743,16 @@ function runMarketDataStream() {
     console.log(`Endpoint: ${MARKET_DATA_STREAM_URL}`);
     console.log(`Symbol: ${SYMBOL}`);
     console.log(`Feed: ${DATA_FEED.toUpperCase()}`);
+    console.log(`Reference timestamp source: Alpaca (${MARKET_TIME_ZONE})`);
+    console.log(
+      `Mode: ${
+        CONNECTION_TEST_MODE
+          ? "30-second connection test"
+          : REFERENCE_TEST_MODE
+            ? "real-trade simulated-open reference test"
+            : "Stage 02 reference capture"
+      }`,
+    );
     console.log("WebSocket connection: opening");
 
     process.once("SIGINT", handleSigint);
@@ -551,9 +832,15 @@ function runMarketDataStream() {
 }
 
 async function main() {
+  if (CONNECTION_TEST_MODE && REFERENCE_TEST_MODE) {
+    throw new Error(
+      "Invalid configuration: JSB_CONNECTION_TEST and JSB_REFERENCE_TEST cannot both be true.",
+    );
+  }
+
   loadLocalEnv();
-  await runRestPreflight();
-  await runMarketDataStream();
+  const clock = await runRestPreflight();
+  await runMarketDataStream(clock);
 }
 
 main().catch((error) => {
