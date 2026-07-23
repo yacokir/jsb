@@ -2,6 +2,7 @@ const ENV_FILE = ".env.local";
 const ALPACA_ENVIRONMENT = "PAPER";
 const ALPACA_BASE_URL = "https://paper-api.alpaca.markets";
 const ACCOUNT_ENDPOINT = `${ALPACA_BASE_URL}/v2/account`;
+const POSITIONS_ENDPOINT = `${ALPACA_BASE_URL}/v2/positions`;
 const REQUEST_TIMEOUT_MS = 10 * 1000;
 const ORDERS_ENABLED = false;
 
@@ -32,6 +33,14 @@ function money(value, currency = "USD") {
     minimumFractionDigits: 2,
     maximumFractionDigits: 2,
   }).format(number);
+}
+
+function percentage(value) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) {
+    return value ?? "-";
+  }
+  return `${(number * 100).toFixed(2)}%`;
 }
 
 function loadEnvironment() {
@@ -105,6 +114,55 @@ async function requestAccount() {
   }
 }
 
+async function requestPositions() {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+
+  try {
+    const response = await fetch(POSITIONS_ENDPOINT, {
+      method: "GET",
+      headers: {
+        Accept: "application/json",
+        "APCA-API-KEY-ID": process.env.ALPACA_API_KEY_ID,
+        "APCA-API-SECRET-KEY": process.env.ALPACA_API_SECRET_KEY,
+      },
+      signal: controller.signal,
+    });
+
+    const requestId = response.headers.get("x-request-id") ?? "missing";
+    const contentType = response.headers.get("content-type") ?? "";
+
+    status("HTTP status", response.status);
+    status("Request ID", requestId);
+    status("Content-Type", contentType || "missing");
+
+    let payload;
+    try {
+      payload = await response.json();
+    } catch (error) {
+      throw new Error(`Alpaca returned invalid JSON: ${error.message}`);
+    }
+
+    if (!response.ok) {
+      const message = payload?.message ?? "Unknown Alpaca error.";
+      throw new Error(`Alpaca HTTP ${response.status}: ${message}`);
+    }
+
+    if (!Array.isArray(payload)) {
+      throw new Error("Alpaca positions response is not an array.");
+    }
+
+    return payload;
+  } catch (error) {
+    if (error.name === "AbortError") {
+      throw new Error(`Alpaca request timed out after ${REQUEST_TIMEOUT_MS} ms.`);
+    }
+    throw error;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 function printAccountSummary(account) {
   const currency = account.currency || "USD";
 
@@ -128,6 +186,46 @@ function printAccountSummary(account) {
   status("Transfers blocked", yesNo(account.transfers_blocked));
   status("Shorting enabled", yesNo(account.shorting_enabled));
   status("Pattern day trader", yesNo(account.pattern_day_trader));
+}
+
+function printPositions(positions, currency) {
+  console.log();
+  line();
+  console.log("ALPACA PAPER OPEN POSITIONS");
+  line();
+
+  if (positions.length === 0) {
+    console.log("Open positions: 0");
+    return;
+  }
+
+  status("Open positions", positions.length);
+
+  positions.forEach((position, index) => {
+    console.log();
+    line("-");
+    console.log(`OPEN POSITION ${index + 1}`);
+    line("-");
+    status("Symbol", position.symbol ?? "-");
+    status("Quantity", position.qty ?? "-");
+    status("Side", position.side ?? "-");
+    status("Average entry price", money(position.avg_entry_price, currency));
+    status("Current price", money(position.current_price, currency));
+    status("Market value", money(position.market_value, currency));
+    status("Cost", money(position.cost_basis, currency));
+    status("Unrealized PnL", money(position.unrealized_pl, currency));
+    status("Unrealized PnL percent", percentage(position.unrealized_plpc));
+  });
+}
+
+function printFinalSummary(openPositions) {
+  console.log();
+  line();
+  console.log("ALPACA PAPER PLAYGROUND SUMMARY");
+  line();
+  status("Account query", "OK");
+  status("Positions query", "OK");
+  status("Open positions", openPositions);
   status("Orders enabled", ORDERS_ENABLED ? "YES" : "NO");
   status("Orders sent", 0);
   status("Result", "SUCCESS");
@@ -135,10 +233,11 @@ function printAccountSummary(account) {
 
 async function main() {
   line();
-  console.log("JSB - ALPACA PLAYGROUND / PHASE B - STEP 1");
+  console.log("JSB - ALPACA PLAYGROUND / PHASE B - STEP 2");
   line();
   status("Environment", ALPACA_ENVIRONMENT);
-  status("Endpoint", ACCOUNT_ENDPOINT);
+  status("Account endpoint", ACCOUNT_ENDPOINT);
+  status("Positions endpoint", POSITIONS_ENDPOINT);
   status("Request method", "GET");
   status("Credentials file", ENV_FILE);
   status("Orders enabled", ORDERS_ENABLED ? "YES" : "NO");
@@ -150,16 +249,29 @@ async function main() {
   status("Configuration", "OK");
   status("Credentials loaded", "YES");
 
+  console.log();
+  line("-");
+  console.log("ACCOUNT REQUEST");
+  line("-");
   const account = await requestAccount();
   status("Authentication", "OK");
   status("Account query", "OK");
   printAccountSummary(account);
+
+  console.log();
+  line("-");
+  console.log("POSITIONS REQUEST");
+  line("-");
+  const positions = await requestPositions();
+  status("Positions query", "OK");
+  printPositions(positions, account.currency || "USD");
+  printFinalSummary(positions.length);
 }
 
 main().catch((error) => {
   console.error();
   line();
-  console.log("ALPACA PAPER ACCOUNT SUMMARY");
+  console.log("ALPACA PAPER PLAYGROUND SUMMARY");
   line();
   status("Result", "ERROR");
   status("Operational error", error.message);
