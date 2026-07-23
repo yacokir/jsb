@@ -1,26 +1,37 @@
 const VERBOSE = false;
-const SYMBOL = "NVDA";
+const DEFAULT_SYMBOL = "NVDA";
+const SYMBOL = (process.argv[2]?.trim() || DEFAULT_SYMBOL).toUpperCase();
 const POLLING_INTERVAL_MS = 2 * 1000;
-const HEARTBEAT_INTERVAL_MS = 5 * 1000;
+const HEARTBEAT_INTERVAL_MS = 15 * 1000;
 const PRE_REFERENCE_TIMEOUT_MS = 60 * 1000;
 const STRATEGY_TIMEOUT_MS = 5 * 60 * 1000;
-const POSITION_TIMEOUT_MS = 60 * 1000;
+const POSITION_TIMEOUT_MS = 60 * 1000; // Tempo maximo para a posicao simulada permanecer aberta antes de fechar por timeout.
 const SIMULATED_OPEN_DELAY_MS = 5 * 1000;
-const ARM_DROP_PERCENT = 0.0004;
-const TAKE_PROFIT_PERCENT = 0.1;
+
+const ARM_DROP_PERCENT = 0.02; // Queda necessária para armar a estratégia.
+const TAKE_PROFIT_PERCENT = 0.025; // Alvo após a entrada.
+const LIMIT_PERCENT_STPL = 0.001; // Margem acima do Stop para o Limit da Buy Stop-Limit.
+
+/*
+const ARM_DROP_PERCENT = 0.0003; // Queda necessária para armar a estratégia.
+const TAKE_PROFIT_PERCENT = 0.0005; // Alvo após a entrada.
+const LIMIT_PERCENT_STPL = 0.0001; // Margem acima do Stop para o Limit da Buy Stop-Limit.
+*/
+
 const SIMULATED_QUANTITY = 100;
 const REQUEST_TIMEOUT_MS = 10 * 1000;
 
 const YAHOO_ENDPOINT_NAME = "CHART v8 / includePrePost";
 const YAHOO_ENDPOINT =
-  `https://query1.finance.yahoo.com/v8/finance/chart/${SYMBOL}` +
+  `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(SYMBOL)}` +
   "?interval=1m&range=1d&includePrePost=true";
 
 const STATES = Object.freeze({
   STARTING: "STARTING",
   WAITING_REFERENCE: "WAITING_REFERENCE",
   WAITING_TRIGGER: "WAITING_TRIGGER",
-  ARMED: "ARMED_WAITING_RECOVERY",
+  WAITING_STOP_ACTIVATION: "WAITING_STOP_ACTIVATION",
+  WAITING_LIMIT_FILL: "WAITING_LIMIT_FILL",
   POSITION_OPEN: "SIMULATED_POSITION_OPEN",
   POSITION_CLOSED_TP: "SIMULATED_POSITION_CLOSED_TP",
   POSITION_CLOSED_TIMEOUT: "SIMULATED_POSITION_CLOSED_TIMEOUT",
@@ -247,7 +258,7 @@ async function requestYahoo(state, showAudit = false) {
 
     if (showAudit) {
       status("JSON structure", "chart.result[0]");
-      status("NVDA present", "YES");
+      status(`${SYMBOL} present`, "YES");
       status("Yahoo market state", sample.marketState);
       status("Selected field", sample.selectedField);
       status("Selected price", sample.price.toFixed(4));
@@ -281,15 +292,50 @@ function isNewSample(sample, previous) {
   );
 }
 
+function acceptSampleTimestamp(state, sample) {
+  if (sample.timestampMs < state.baseTimestampMs) {
+    state.metrics.staleSamplesDiscarded += 1;
+    console.log(
+      `Sample discarded | STALE | Sample: ${sample.timestamp} | Reference: ${state.baseTimestamp}`,
+    );
+    return false;
+  }
+
+  if (
+    state.lastAcceptedTimestampMs !== null &&
+    sample.timestampMs < state.lastAcceptedTimestampMs
+  ) {
+    state.metrics.outOfOrderDiscarded += 1;
+    console.log(
+      `Sample discarded | OUT_OF_ORDER | Sample: ${sample.timestamp} | Reference: ${state.lastAcceptedTimestamp}`,
+    );
+    return false;
+  }
+
+  if (sample.timestampMs === state.lastAcceptedTimestampMs) {
+    return false;
+  }
+
+  state.lastAcceptedTimestampMs = sample.timestampMs;
+  state.lastAcceptedTimestamp = sample.timestamp;
+  return true;
+}
+
 function printHeartbeat(state, sample) {
-  console.log();
+  const displayedState =
+    state.currentState === STATES.POSITION_OPEN ? "POSITION_OPEN" : state.currentState;
+  const arm = state.armTriggerPrice?.toFixed(4) ?? "-";
+  const stop = state.stopPrice?.toFixed(4) ?? "-";
+  const limit = state.limitPrice?.toFixed(4) ?? "-";
+  const entry = state.position?.entryPrice?.toFixed(4) ?? "-";
+
   line("-");
-  console.log("Heartbeat");
-  status("Elapsed", `${((Date.now() - state.startedAtMs) / 1000).toFixed(1)} s`);
-  status("Samples", state.metrics.uniqueSamples);
-  status("Current price", sample.price.toFixed(4));
-  status("Current state", state.currentState);
-  line("-");
+  console.log(
+    `Heartbeat | Elapsed: ${((Date.now() - state.startedAtMs) / 1000).toFixed(1)} s | Samples: ${state.metrics.uniqueSamples} | State: ${displayedState}`,
+  );
+  console.log(
+    `Price: ${sample.price.toFixed(4)} | Arm: ${arm} | Stop: ${stop} | Limit: ${limit} | Entry: ${entry}`,
+  );
 }
 
 function printEvent(title) {
@@ -304,6 +350,8 @@ function establishReference(state, sample) {
   state.referencePrice =
     (state.lastPremarketSample.price + state.firstRegularSample.price) / 2;
   state.armTriggerPrice = state.referencePrice * (1 - ARM_DROP_PERCENT);
+  state.stopPrice = state.referencePrice;
+  state.limitPrice = state.referencePrice * (1 + LIMIT_PERCENT_STPL);
   state.strategyStartedAtMs = Date.now();
   transitionTo(state, STATES.WAITING_TRIGGER, "reference calculated");
 
@@ -312,6 +360,8 @@ function establishReference(state, sample) {
   status("First simulated regular", state.firstRegularSample.price.toFixed(4));
   status("Reference", state.referencePrice.toFixed(4));
   status("Arm trigger", state.armTriggerPrice.toFixed(4));
+  status("Stop price", state.stopPrice.toFixed(4));
+  status("Limit price", state.limitPrice.toFixed(4));
   status("Timestamp basis", sample.timestampBasis);
   status("Yahoo market state", sample.marketState);
 }
@@ -322,7 +372,6 @@ function armStrategy(state, sample) {
   state.armTimestampMs = sample.timestampMs;
   state.armPrice = sample.price;
   state.armDropPercent = (sample.price / state.referencePrice - 1) * 100;
-  transitionTo(state, STATES.ARMED, "arm trigger reached");
 
   printEvent("STRATEGY ARMED");
   status("Reference", state.referencePrice.toFixed(4));
@@ -331,28 +380,73 @@ function armStrategy(state, sample) {
   status("Drop", `${state.armDropPercent.toFixed(4)} %`);
   status("Timestamp", sample.timestamp);
   console.log("Simulation only. No order sent.");
+
+  state.buyStopLimit = {
+    stopPrice: state.stopPrice,
+    limitPrice: state.limitPrice,
+    quantity: SIMULATED_QUANTITY,
+    createdTimestamp: sample.timestamp,
+    state: "PENDING_STOP",
+    activationPrice: null,
+    activationTimestamp: null,
+    fillPrice: null,
+    fillTimestamp: null,
+    cancelReason: null,
+  };
+  state.buyStopLimitCreated = true;
+  transitionTo(
+    state,
+    STATES.WAITING_STOP_ACTIVATION,
+    "simulated Buy Stop-Limit created",
+  );
+
+  printEvent("BUY STOP-LIMIT CREATED");
+  status("Stop price", state.buyStopLimit.stopPrice.toFixed(4));
+  status("Limit price", state.buyStopLimit.limitPrice.toFixed(4));
+  status("Quantity", state.buyStopLimit.quantity);
+  status("Order state", state.buyStopLimit.state);
+  console.log("Simulation only. No order sent.");
 }
 
-function simulateBuyAndTakeProfit(state, sample) {
-  state.recoveryReached = true;
-  state.recoveryTimestamp = sample.timestamp;
-  state.recoveryPrice = sample.price;
-  state.timeArmedToRecoverySeconds =
-    (sample.timestampMs - state.armTimestampMs) / 1000;
+function activateBuyStop(state, sample) {
+  state.buyStopLimit.state = "ACTIVE_LIMIT";
+  state.buyStopLimit.activationPrice = sample.price;
+  state.buyStopLimit.activationTimestamp = sample.timestamp;
+  state.stopActivated = true;
+  state.stopActivationTimestamp = sample.timestamp;
 
-  printEvent("RECOVERY REACHED");
-  status("Reference", state.referencePrice.toFixed(4));
-  status("Recovery price", sample.price.toFixed(4));
-  status("Recovery timestamp", sample.timestamp);
-  status("Time since armed", `${state.timeArmedToRecoverySeconds.toFixed(1)} seconds`);
+  printEvent("BUY STOP ACTIVATED");
+  status("Stop price", state.stopPrice.toFixed(4));
+  status("Activation price", sample.price.toFixed(4));
+  status("Activation timestamp", sample.timestamp);
+  status("Order state", state.buyStopLimit.state);
 
-  console.log();
-  console.log("========================================");
-  console.log("BUY ORDER WOULD BE SENT HERE");
-  console.log("========================================");
+  if (sample.price <= state.limitPrice) {
+    fillBuyStopLimitAndCreateTakeProfit(state, sample);
+  } else {
+    transitionTo(
+      state,
+      STATES.WAITING_LIMIT_FILL,
+      "Stop activated above Limit; waiting for fill",
+    );
+  }
+}
+
+function fillBuyStopLimitAndCreateTakeProfit(state, sample) {
+  const entryPrice = Math.min(sample.price, state.limitPrice);
+  state.buyStopLimit.state = "FILLED";
+  state.buyStopLimit.fillPrice = entryPrice;
+  state.buyStopLimit.fillTimestamp = sample.timestamp;
+  state.limitFilled = true;
+
+  printEvent("BUY STOP-LIMIT FILLED");
+  status("Entry price", entryPrice.toFixed(4));
+  status("Fill timestamp", sample.timestamp);
+  status("Quantity", state.buyStopLimit.quantity);
 
   state.position = {
-    entryPrice: sample.price,
+    entryPrice,
+    limitPrice: state.limitPrice,
     quantity: SIMULATED_QUANTITY,
     entryTimestamp: sample.timestamp,
     openedAtMs: Date.now(),
@@ -363,20 +457,31 @@ function simulateBuyAndTakeProfit(state, sample) {
   };
   state.simulatedBuyCreated = true;
   state.takeProfit = {
-    price: sample.price * (1 + TAKE_PROFIT_PERCENT),
+    price: entryPrice * (1 + TAKE_PROFIT_PERCENT),
     status: "ACTIVE",
   };
-  transitionTo(state, STATES.POSITION_OPEN, "recovery reached; simulated buy filled");
+  transitionTo(state, STATES.POSITION_OPEN, "simulated Buy Stop-Limit filled");
 
-  status("Simulated entry", state.position.entryPrice.toFixed(4));
-  status("Simulated quantity", state.position.quantity);
-  status("Position state", state.position.status);
-  console.log("No order sent.");
   console.log();
   console.log("TP WOULD BE CREATED HERE");
   status("Simulated TP", state.takeProfit.price.toFixed(4));
   status("TP gain", `${(TAKE_PROFIT_PERCENT * 100).toFixed(2)}%`);
   console.log("No order sent.");
+}
+
+function cancelBuyStopLimit(state, reason) {
+  if (!["PENDING_STOP", "ACTIVE_LIMIT"].includes(state.buyStopLimit?.state)) {
+    return;
+  }
+  const previousState = state.buyStopLimit.state;
+  state.buyStopLimit.state = "CANCELLED";
+  state.buyStopLimit.cancelReason = reason;
+  state.orderCancelled = true;
+
+  printEvent("BUY STOP-LIMIT CANCELLED");
+  status("Previous state", previousState);
+  status("Reason", reason);
+  console.log("Simulation only.");
 }
 
 function closeAtTakeProfit(state, sample) {
@@ -412,6 +517,7 @@ function closeAtTimeout(state, sample) {
 }
 
 function closeForManualInterruption(state) {
+  cancelBuyStopLimit(state, "MANUAL_INTERRUPTION");
   if (state.position?.status === "OPEN") {
     state.position.status = "CLOSED";
     state.position.exitPrice = state.latestValidSample?.price ?? null;
@@ -429,13 +535,13 @@ function closeForManualInterruption(state) {
 
 function processUniqueSample(state, sample) {
   state.metrics.uniqueSamples += 1;
+  const previousSample = state.previousUniqueSample;
   state.previousUniqueSample = sample;
   state.lowestPrice =
     state.lowestPrice === null ? sample.price : Math.min(state.lowestPrice, sample.price);
 
   if (state.currentState === STATES.WAITING_REFERENCE) {
-    if (!state.baseTimestamp) {
-      state.baseTimestamp = sample.timestamp;
+    if (state.simulatedOpenMs === null) {
       state.simulatedOpenMs = sample.timestampMs + SIMULATED_OPEN_DELAY_MS;
       state.simulatedOpenTimestamp = new Date(state.simulatedOpenMs).toISOString();
       printEvent("SIMULATED REFERENCE WINDOW");
@@ -461,8 +567,21 @@ function processUniqueSample(state, sample) {
     return;
   }
 
-  if (state.currentState === STATES.ARMED && sample.price >= state.referencePrice) {
-    simulateBuyAndTakeProfit(state, sample);
+  if (
+    state.currentState === STATES.WAITING_STOP_ACTIVATION &&
+    previousSample &&
+    previousSample.price < state.stopPrice &&
+    sample.price >= state.stopPrice
+  ) {
+    activateBuyStop(state, sample);
+    return;
+  }
+
+  if (
+    state.currentState === STATES.WAITING_LIMIT_FILL &&
+    sample.price <= state.limitPrice
+  ) {
+    fillBuyStopLimitAndCreateTakeProfit(state, sample);
     return;
   }
 
@@ -496,22 +615,31 @@ function printFinalSummary(state) {
   line();
   console.log("EXECUTION PLAYGROUND SUMMARY");
   line();
+  status("Symbol", SYMBOL);
   status("Market data source", "YAHOO FINANCE");
   status("Requests attempted", state.metrics.requestsAttempted);
   status("Requests successful", state.metrics.requestsSuccessful);
   status("Valid samples", state.metrics.validSamples);
   status("Unique samples", state.metrics.uniqueSamples);
+  status("Stale samples discarded", state.metrics.staleSamplesDiscarded);
+  status("Out-of-order discarded", state.metrics.outOfOrderDiscarded);
   status("HTTP errors", state.metrics.httpErrors);
   status("Parsing errors", state.metrics.parsingErrors);
   status("Reference", state.referencePrice?.toFixed(4) ?? "-");
   status("Arm trigger", state.armTriggerPrice?.toFixed(4) ?? "-");
   status("Strategy armed", state.strategyArmed ? "YES" : "NO");
   status("Arm timestamp", state.armTimestamp ?? "-");
-  status("Recovery reached", state.recoveryReached ? "YES" : "NO");
-  status("Recovery timestamp", state.recoveryTimestamp ?? "-");
+  status("Buy Stop-Limit Created", state.buyStopLimitCreated ? "YES" : "NO");
+  status("Stop Price", state.stopPrice?.toFixed(4) ?? "-");
+  status("Stop Activated", state.stopActivated ? "YES" : "NO");
+  status("Stop Activation Time", state.stopActivationTimestamp ?? "-");
+  status("Limit Price", state.limitPrice?.toFixed(4) ?? "-");
+  status("Limit Filled", state.limitFilled ? "YES" : "NO");
+  status("Order Cancelled", state.orderCancelled ? "YES" : "NO");
+  status("Order Final State", state.buyStopLimit?.state ?? "NOT_CREATED");
   status("Simulated buy", state.simulatedBuyCreated ? "YES" : "NO");
   status("Entry price", state.position?.entryPrice?.toFixed(4) ?? "-");
-  status("Quantity", state.position?.quantity ?? "-");
+  status("Quantity", state.position?.quantity ?? state.buyStopLimit?.quantity ?? "-");
   status("Simulated TP", state.takeProfit?.price?.toFixed(4) ?? "-");
   status("TP state", state.takeProfit?.status ?? "NOT_CREATED");
   status("Exit reason", state.position?.exitReason ?? state.exitReason ?? "-");
@@ -543,9 +671,11 @@ function printStateTransitions(state, result) {
 }
 
 async function runStateMachine() {
+  const startedAtMs = Date.now();
+  const baseTimestampMs = Math.floor(startedAtMs / 1000) * 1000;
   const state = {
-    startedAtMs: Date.now(),
-    nextHeartbeatAtMs: Date.now() + HEARTBEAT_INTERVAL_MS,
+    startedAtMs,
+    nextHeartbeatAtMs: startedAtMs + HEARTBEAT_INTERVAL_MS,
     currentState: STATES.STARTING,
     transitions: [],
     finished: false,
@@ -558,26 +688,35 @@ async function runStateMachine() {
       invalidSamples: 0,
       httpErrors: 0,
       parsingErrors: 0,
+      staleSamplesDiscarded: 0,
+      outOfOrderDiscarded: 0,
     },
     previousUniqueSample: null,
     latestValidSample: null,
-    baseTimestamp: null,
+    baseTimestampMs,
+    baseTimestamp: new Date(baseTimestampMs).toISOString(),
+    lastAcceptedTimestampMs: null,
+    lastAcceptedTimestamp: null,
     simulatedOpenMs: null,
     simulatedOpenTimestamp: null,
     lastPremarketSample: null,
     firstRegularSample: null,
     referencePrice: null,
     armTriggerPrice: null,
+    stopPrice: null,
+    limitPrice: null,
     strategyStartedAtMs: null,
     strategyArmed: false,
     armTimestamp: null,
     armTimestampMs: null,
     armPrice: null,
     armDropPercent: null,
-    recoveryReached: false,
-    recoveryTimestamp: null,
-    recoveryPrice: null,
-    timeArmedToRecoverySeconds: null,
+    buyStopLimit: null,
+    buyStopLimitCreated: false,
+    stopActivated: false,
+    stopActivationTimestamp: null,
+    limitFilled: false,
+    orderCancelled: false,
     simulatedBuyCreated: false,
     takeProfit: null,
     position: null,
@@ -624,18 +763,20 @@ async function runStateMachine() {
         break;
       }
 
-      if (sample) {
-        state.latestValidSample = sample;
-        if (isNewSample(sample, state.previousUniqueSample)) {
-          processUniqueSample(state, sample);
+      const acceptedSample = sample && acceptSampleTimestamp(state, sample) ? sample : null;
+
+      if (acceptedSample) {
+        state.latestValidSample = acceptedSample;
+        if (isNewSample(acceptedSample, state.previousUniqueSample)) {
+          processUniqueSample(state, acceptedSample);
         } else {
           verbose("Duplicate Yahoo sample ignored by the state machine.");
         }
       }
 
       const now = Date.now();
-      if (sample && now >= state.nextHeartbeatAtMs) {
-        printHeartbeat(state, sample);
+      if (acceptedSample && now >= state.nextHeartbeatAtMs) {
+        printHeartbeat(state, acceptedSample);
         while (state.nextHeartbeatAtMs <= now) {
           state.nextHeartbeatAtMs += HEARTBEAT_INTERVAL_MS;
         }
@@ -649,11 +790,16 @@ async function runStateMachine() {
         state.exitReason = "PRE_REFERENCE_TIMEOUT";
         state.finished = true;
       } else if (
-        [STATES.WAITING_TRIGGER, STATES.ARMED].includes(state.currentState) &&
+        [
+          STATES.WAITING_TRIGGER,
+          STATES.WAITING_STOP_ACTIVATION,
+          STATES.WAITING_LIMIT_FILL,
+        ].includes(state.currentState) &&
         now - state.strategyStartedAtMs >= STRATEGY_TIMEOUT_MS
       ) {
         printEvent("STRATEGY TIMEOUT");
         console.log("No simulated entry occurred within the configured strategy window.");
+        cancelBuyStopLimit(state, "STRATEGY_TIMEOUT");
         transitionTo(state, STATES.FINISHED_NO_ENTRY, "strategy timeout before entry");
         state.exitReason = "STRATEGY_TIMEOUT_BEFORE_ENTRY";
         state.finished = true;
@@ -673,6 +819,7 @@ async function runStateMachine() {
     if (!state.manualInterrupted) {
       state.errorMessage = error.message;
       state.exitReason = "ERROR";
+      cancelBuyStopLimit(state, "OPERATIONAL_ERROR");
       if (state.position?.status === "OPEN") {
         state.position.status = "CLOSED";
         state.position.exitPrice = state.latestValidSample?.price ?? null;
