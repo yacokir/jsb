@@ -4,17 +4,23 @@ const MODE = (process.argv[3]?.trim() ?? "").toLowerCase();
 
 const QUANTITY = 1;
 
-const ARM_DROP_PERCENT = 0.02;
+// Defines how many minutes the BUY STOP-LIMIT may wait for execution before cancellation.
+const BUY_ACTIVE_TIMEOUT_MINUTES = 5;
+// Defines the total time available for the strategy to arm, submit, and monitor orders.
+const STRATEGY_TOTAL_DURATION_MINUTES = 10;
+
+const ARM_DROP_PERCENT = 0.05;
 const TAKE_PROFIT_PERCENT = 0.025;
-const LIMIT_PERCENT_STPL = 0.001;
+const LIMIT_PERCENT_STPL = 0.01;
 const INITIAL_OBSERVATION_MS = 60 * 1000;
 
-const ENTRY_WINDOW_MS = 5 * 60 * 1000;
+const ENTRY_WINDOW_MS = STRATEGY_TOTAL_DURATION_MINUTES * 60 * 1000;
 const POSITION_TIMEOUT_MS = 60 * 1000;
 
 const PRICE_POLL_INTERVAL_MS = 1 * 1000;
 const ORDER_POLL_INTERVAL_MS = 1 * 1000;
 const ORDER_POLL_TIMEOUT_MS = 30 * 1000;
+const BUY_ORDER_ACTIVE_MS = BUY_ACTIVE_TIMEOUT_MINUTES * 60 * 1000;
 const HTTP_TIMEOUT_MS = 10 * 1000;
 
 const TEST_SIGNAL_DELAY_MS = 2 * 1000;
@@ -69,6 +75,11 @@ const report = {
   entryDecision: null,
   armReason: null,
   buyStatus: null,
+  buyActiveDurationMs: null,
+  buyLastMarketPrice: null,
+  buyDistanceToStop: null,
+  buyLastTradeAgeSeconds: null,
+  buyCancellationConfirmed: null,
   boughtQuantity: null,
   buyAveragePrice: null,
   takeProfitPrice: null,
@@ -187,6 +198,8 @@ function validateConfiguration() {
     ARM_DROP_PERCENT,
     TAKE_PROFIT_PERCENT,
     LIMIT_PERCENT_STPL,
+    BUY_ACTIVE_TIMEOUT_MINUTES,
+    STRATEGY_TOTAL_DURATION_MINUTES,
     INITIAL_OBSERVATION_MS,
     ENTRY_WINDOW_MS,
     POSITION_TIMEOUT_MS,
@@ -220,7 +233,8 @@ function loadCredentials() {
 
 async function requestAlpaca(url, options = {}) {
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), HTTP_TIMEOUT_MS);
+  const timeoutMs = options.timeoutMs ?? HTTP_TIMEOUT_MS;
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
 
   try {
     const response = await fetch(url, {
@@ -252,7 +266,11 @@ async function requestAlpaca(url, options = {}) {
     return payload;
   } catch (error) {
     if (error.name === "AbortError") {
-      throw new Error(`Alpaca request timed out after ${HTTP_TIMEOUT_MS} ms.`);
+      const timeoutError = new Error(
+        `Alpaca request timed out after ${timeoutMs} ms.`,
+      );
+      timeoutError.code = "ALPACA_TIMEOUT";
+      throw timeoutError;
     }
     if (error instanceof TypeError) {
       throw new Error(`Alpaca network error: ${error.message}`);
@@ -382,12 +400,56 @@ async function requestFirstRegularTrade(startMs, endMs) {
     sort: "asc",
     limit: "1",
   });
-  const payload = await requestAlpaca(
-    `${ALPACA_DATA_URL}/v2/stocks/${encodeURIComponent(SYMBOL)}/trades?${query}`,
-  );
+  const remainingMs = Math.max(1, endMs - Date.now());
+  let payload;
+  try {
+    payload = await requestAlpaca(
+      `${ALPACA_DATA_URL}/v2/stocks/${encodeURIComponent(SYMBOL)}/trades?${query}`,
+      { timeoutMs: Math.min(HTTP_TIMEOUT_MS, remainingMs) },
+    );
+  } catch (error) {
+    if (error.code === "ALPACA_TIMEOUT" && remainingMs <= HTTP_TIMEOUT_MS) {
+      return null;
+    }
+    throw error;
+  }
 
-  if (payload?.symbol !== SYMBOL || !Array.isArray(payload?.trades)) {
-    throw new Error("Alpaca returned an invalid historical trades response.");
+  if (
+    payload === null ||
+    (typeof payload === "object" &&
+      !Array.isArray(payload) &&
+      (payload.trades === null || payload.trades === undefined) &&
+      Object.keys(payload).every((key) =>
+        ["symbol", "trades", "next_page_token"].includes(key),
+      ))
+  ) {
+    return null;
+  }
+  if (
+    typeof payload !== "object" ||
+    Array.isArray(payload) ||
+    !Array.isArray(payload.trades) ||
+    (payload.symbol !== undefined && payload.symbol !== SYMBOL)
+  ) {
+    const payloadType =
+      payload === null
+        ? "null"
+        : Array.isArray(payload)
+          ? "array"
+          : typeof payload;
+    const keys =
+      payload && typeof payload === "object"
+        ? Object.keys(payload).slice(0, 8).join(", ") || "none"
+        : "none";
+    const tradesType = Array.isArray(payload?.trades)
+      ? `array(${payload.trades.length})`
+      : payload?.trades === null
+        ? "null"
+        : typeof payload?.trades;
+    throw new Error(
+      "Alpaca returned an unexpected historical trades format | " +
+        `payload: ${payloadType} | keys: ${keys} | trades: ${tradesType}`,
+    );
   }
   if (payload.trades.length === 0) {
     return null;
@@ -404,7 +466,7 @@ async function requestFirstRegularTrade(startMs, endMs) {
     timestampMs < startMs ||
     timestampMs > endMs
   ) {
-    throw new Error("Alpaca returned an invalid first regular trade.");
+    return null;
   }
 
   return { price, timestamp };
@@ -482,11 +544,38 @@ function calculateStrategyPrices(referencePrice) {
   };
 }
 
-async function pollOrder(clientOrderId, side, externalDeadlineMs = Infinity) {
+function describeOrderStatus(orderStatus) {
+  switch (orderStatus?.toLowerCase()) {
+    case "pending_new":
+      return "received by broker";
+    case "new":
+      return "accepted and active";
+    case "filled":
+      return "executed";
+    case "canceled":
+      return "canceled";
+    case "rejected":
+      return "rejected";
+    default:
+      return "status reported by broker";
+  }
+}
+
+async function pollOrder(
+  clientOrderId,
+  side,
+  externalDeadlineMs = Infinity,
+  buyMonitoring = null,
+) {
+  const isBuy = side.toLowerCase() === "buy";
+  const pollingTimeoutMs =
+    isBuy ? BUY_ORDER_ACTIVE_MS : ORDER_POLL_TIMEOUT_MS;
+  const regularCloseMs =
+    isBuy ? Infinity : operation.regularCloseMs ?? Infinity;
   const deadlineMs = Math.min(
-    Date.now() + ORDER_POLL_TIMEOUT_MS,
+    Date.now() + pollingTimeoutMs,
     externalDeadlineMs,
-    operation.regularCloseMs ?? Infinity,
+    regularCloseMs,
   );
   let previousStatus = null;
   let lastOrder = null;
@@ -499,10 +588,51 @@ async function pollOrder(clientOrderId, side, externalDeadlineMs = Infinity) {
     }
     const orderStatus = order.status?.toLowerCase();
     if (orderStatus !== previousStatus) {
-      status(`${side.toUpperCase()} status`, orderStatus ?? "-");
+      status(
+        `${side.toUpperCase()} status`,
+        `${orderStatus ?? "-"} (${describeOrderStatus(orderStatus)})`,
+      );
       status("Filled quantity", order.filled_qty ?? "0");
       previousStatus = orderStatus;
     }
+
+    if (isBuy && buyMonitoring) {
+      const trade = await requestLatestAlpacaTrade();
+      const accepted = acceptRegularTrade(
+        trade,
+        buyMonitoring.sessionDate,
+        buyMonitoring.tracker,
+      );
+      if (accepted) {
+        buyMonitoring.lastTrade = accepted;
+      }
+      const lastTrade = buyMonitoring.lastTrade;
+      const tradeAgeSeconds = Number.isFinite(lastTrade?.timestampMs)
+        ? Math.max(0, Math.floor((Date.now() - lastTrade.timestampMs) / 1000))
+        : null;
+      const distanceToStop = Number.isFinite(lastTrade?.price)
+        ? (lastTrade.price / buyMonitoring.stopPrice - 1) * 100
+        : null;
+      const tradeAgeText =
+        tradeAgeSeconds === null
+          ? "Trade age -"
+          : tradeAgeSeconds >= 30
+            ? `NO TRADE FOR ${tradeAgeSeconds}s`
+            : `Trade age ${tradeAgeSeconds}s`;
+      console.log(
+        `${marketTime().time} ET | ` +
+          `Last ${lastTrade?.price?.toFixed(4) ?? "-"} | ` +
+          `Stop ${buyMonitoring.stopPrice.toFixed(4)} | ` +
+          `Distance ${distanceToStop === null ? "-" : `${distanceToStop >= 0 ? "+" : ""}${distanceToStop.toFixed(2)}%`} | ` +
+          `BUY ${orderStatus ?? "-"} (${describeOrderStatus(orderStatus)}) | ` +
+          `Filled ${order.filled_qty ?? "0"}/${order.qty ?? QUANTITY} | ` +
+          tradeAgeText,
+      );
+      buyMonitoring.lastMarketPrice = lastTrade?.price ?? null;
+      buyMonitoring.distanceToStop = distanceToStop;
+      buyMonitoring.lastTradeAgeSeconds = tradeAgeSeconds;
+    }
+
     if (orderStatus === "filled" || TERMINAL_ORDER_STATUSES.has(orderStatus)) {
       return order;
     }
@@ -517,7 +647,17 @@ async function pollOrder(clientOrderId, side, externalDeadlineMs = Infinity) {
       `Last status: ${lastOrder?.status ?? "not observed"} | ` +
       `Filled quantity: ${lastOrder?.filled_qty ?? "not observed"}`,
   );
+  if (isBuy && Number.isFinite(buyMonitoring?.lastTrade?.timestampMs)) {
+    buyMonitoring.lastTradeAgeSeconds = Math.max(
+      0,
+      Math.floor(
+        (Date.now() - buyMonitoring.lastTrade.timestampMs) / 1000,
+      ),
+    );
+  }
+  error.code = "ORDER_POLL_TIMEOUT";
   error.lastOrder = lastOrder;
+  error.buyMonitoring = buyMonitoring;
   throw error;
 }
 
@@ -617,10 +757,7 @@ function printCriticalWarning(error, state, buyOrder, sellOrder) {
 }
 
 async function waitUntilOwnBuyIsClosed(clientOrderId) {
-  const deadlineMs = Math.min(
-    Date.now() + ORDER_POLL_TIMEOUT_MS,
-    operation.regularCloseMs ?? Infinity,
-  );
+  const deadlineMs = Date.now() + ORDER_POLL_TIMEOUT_MS;
   let orders = [];
   while (Date.now() < deadlineMs) {
     orders = await requestSymbolOpenOrders();
@@ -636,6 +773,8 @@ async function waitUntilOwnBuyIsClosed(clientOrderId) {
 
 async function resolveBuyFailure(originalError, lastOrder) {
   let buyOrder = lastOrder;
+  let cancellationRequested = false;
+  let cancellationError = null;
   try {
     buyOrder = await requestOrderByClientOrderId(operation.buyClientOrderId);
   } catch (error) {
@@ -657,6 +796,7 @@ async function resolveBuyFailure(originalError, lastOrder) {
     status("Order ID", ownOpenBuy.id);
     try {
       await cancelOwnBuyOrder(ownOpenBuy.id);
+      cancellationRequested = true;
       status("Cancel request", "SENT ONCE");
       const remaining = await waitUntilOwnBuyIsClosed(
         operation.buyClientOrderId,
@@ -671,6 +811,7 @@ async function resolveBuyFailure(originalError, lastOrder) {
           : "NO",
       );
     } catch (error) {
+      cancellationError = error;
       status("Cancel error", error.message);
     }
   }
@@ -694,9 +835,28 @@ async function resolveBuyFailure(originalError, lastOrder) {
         order.client_order_id === operation.buyClientOrderId,
     );
   const observedFill = Number(buyOrder?.filled_qty ?? 0);
+  const cancellationConfirmed =
+    cancellationRequested && state.ordersKnown && !buyStillOpen;
+
+  if (cancellationError) {
+    printCriticalWarning(cancellationError, state, buyOrder, null);
+    return {
+      result: "CRITICAL",
+      buyOrder,
+      position: null,
+      state,
+      cancellationConfirmed: false,
+    };
+  }
 
   if (clean && observedFill <= 0) {
-    return { result: "NO BUY FILL", buyOrder, position: null };
+    return {
+      result: "NO BUY FILL",
+      buyOrder,
+      position: null,
+      state,
+      cancellationConfirmed,
+    };
   }
   if (
     state.positionKnown &&
@@ -705,11 +865,23 @@ async function resolveBuyFailure(originalError, lastOrder) {
     !buyStillOpen &&
     state.openOrders.length === 0
   ) {
-    return { result: "POSITION", buyOrder, position: state.position };
+    return {
+      result: "POSITION",
+      buyOrder,
+      position: state.position,
+      state,
+      cancellationConfirmed,
+    };
   }
 
   printCriticalWarning(originalError, state, buyOrder, null);
-  return { result: "CRITICAL", buyOrder, position: null };
+  return {
+    result: "CRITICAL",
+    buyOrder,
+    position: null,
+    state,
+    cancellationConfirmed,
+  };
 }
 
 async function finishWithoutPosition(result, reason) {
@@ -877,6 +1049,10 @@ async function prepareOpeningSignals(sessionDate) {
       }
     : null;
   if (!openingTrade) {
+    status(
+      "Opening trade",
+      "NOT AVAILABLE BETWEEN 09:30:00 AND 09:31:00 ET",
+    );
     return null;
   }
 
@@ -1107,8 +1283,14 @@ async function determineEntryDecision(setup, signalState, entryDeadlineMs) {
     );
     if (accepted) {
       lastTrade = accepted;
+      const distanceToArm =
+        (accepted.price / setup.armPrice - 1) * 100;
       console.log(
-        `${accepted.marketTime} ET | Real price ${accepted.price.toFixed(4)} | WAITING FOR ARM`,
+        `${accepted.marketTime} ET | ` +
+          `Last ${accepted.price.toFixed(4)} | ` +
+          `Arm ${setup.armPrice.toFixed(4)} | ` +
+          `Distance ${distanceToArm >= 0 ? "+" : ""}${distanceToArm.toFixed(2)}% | ` +
+          "WAITING FOR ARM",
       );
       if (accepted.price <= setup.armPrice) {
         section("STRATEGY ARMED");
@@ -1132,7 +1314,63 @@ async function determineEntryDecision(setup, signalState, entryDeadlineMs) {
   return { sendOrder: false, aborted: false, reason: report.entryDecision };
 }
 
-async function executeBuy(setup, entryDeadlineMs) {
+function printBuyTimeoutResult(timeoutError, resolution, activeDurationMs) {
+  const monitoring = timeoutError.buyMonitoring;
+  const lastOrder = timeoutError.lastOrder;
+  const finalStatus = resolution.buyOrder?.status ?? "UNKNOWN";
+  const activeSeconds = Math.round(activeDurationMs / 1000);
+
+  section("BUY TIMEOUT — NO FILL");
+  status(
+    "Active duration",
+    activeSeconds % 60 === 0
+      ? `${activeSeconds / 60} minutes`
+      : `${activeSeconds} seconds`,
+  );
+  status(
+    "Last status before cancel",
+    `${lastOrder?.status ?? "UNKNOWN"} (${describeOrderStatus(lastOrder?.status)})`,
+  );
+  status("Filled quantity", lastOrder?.filled_qty ?? "0");
+  status(
+    "Last market price",
+    monitoring?.lastMarketPrice?.toFixed(4) ?? "-",
+  );
+  status(
+    "Distance to stop",
+    Number.isFinite(monitoring?.distanceToStop)
+      ? `${monitoring.distanceToStop >= 0 ? "+" : ""}${monitoring.distanceToStop.toFixed(2)}%`
+      : "-",
+  );
+  status(
+    "Last trade age",
+    Number.isFinite(monitoring?.lastTradeAgeSeconds)
+      ? `${monitoring.lastTradeAgeSeconds} seconds`
+      : "-",
+  );
+  status(
+    "Final BUY status",
+    `${finalStatus} (${describeOrderStatus(finalStatus)})`,
+  );
+  status(
+    "Cancellation",
+    resolution.cancellationConfirmed ? "CONFIRMED" : "NOT CONFIRMED",
+  );
+  status(
+    "Final position",
+    resolution.state?.positionKnown
+      ? resolution.state.position?.qty ?? "0"
+      : "UNKNOWN",
+  );
+  status(
+    "Final open orders",
+    resolution.state?.ordersKnown
+      ? resolution.state.openOrders.length
+      : "UNKNOWN",
+  );
+}
+
+async function executeBuy(setup, signalState) {
   await validateRegularMarket();
   const clientOrderId = createClientOrderId("buy");
   operation.stage = "SUBMITTING BUY STOP-LIMIT";
@@ -1146,6 +1384,27 @@ async function executeBuy(setup, entryDeadlineMs) {
   status("Stop price", setup.buyStopPrice.text);
   status("Limit price", setup.buyLimitPrice.text);
   status("Client Order ID", clientOrderId);
+  const buySubmittedAtMs = Date.now();
+  const buyDeadlineMs = buySubmittedAtMs + BUY_ORDER_ACTIVE_MS;
+  const buyMonitoring = {
+    sessionDate: signalState.sessionDate,
+    tracker: signalState.tracker,
+    lastTrade: signalState.lastTrade,
+    stopPrice: setup.buyStopPrice.number,
+    lastMarketPrice: signalState.lastTrade?.price ?? null,
+    distanceToStop: Number.isFinite(signalState.lastTrade?.price)
+      ? (signalState.lastTrade.price / setup.buyStopPrice.number - 1) * 100
+      : null,
+    lastTradeAgeSeconds: Number.isFinite(signalState.lastTrade?.timestampMs)
+      ? Math.max(
+          0,
+          Math.floor(
+            (buySubmittedAtMs - signalState.lastTrade.timestampMs) / 1000,
+          ),
+        )
+      : null,
+  };
+  status("BUY active deadline", new Date(buyDeadlineMs).toISOString());
   await submitStopLimitBuyOrder(
     setup.buyStopPrice.text,
     setup.buyLimitPrice.text,
@@ -1153,10 +1412,13 @@ async function executeBuy(setup, entryDeadlineMs) {
   );
 
   operation.stage = "POLLING BUY STOP-LIMIT";
-  const pollDeadline =
-    MODE === "opening" ? entryDeadlineMs : operation.regularCloseMs;
   try {
-    const order = await pollOrder(clientOrderId, "buy", pollDeadline);
+    const order = await pollOrder(
+      clientOrderId,
+      "buy",
+      buyDeadlineMs,
+      buyMonitoring,
+    );
     operation.buyOrder = order;
     report.buyStatus = order.status;
     if (order.status !== "filled") {
@@ -1171,13 +1433,29 @@ async function executeBuy(setup, entryDeadlineMs) {
     }
     return { result: "POSITION", buyOrder: order, position };
   } catch (error) {
-    printOriginalError(error);
+    const isExpectedBuyTimeout = error.code === "ORDER_POLL_TIMEOUT";
+    if (!isExpectedBuyTimeout) {
+      printOriginalError(error);
+    }
     const resolution = await resolveBuyFailure(
       error,
       error.lastOrder ?? operation.buyOrder,
     );
     operation.buyOrder = resolution.buyOrder;
     report.buyStatus = resolution.buyOrder?.status ?? "UNKNOWN";
+    if (isExpectedBuyTimeout && resolution.result === "NO BUY FILL") {
+      const activeDurationMs = Math.min(
+        BUY_ORDER_ACTIVE_MS,
+        Math.max(0, Date.now() - buySubmittedAtMs),
+      );
+      report.buyActiveDurationMs = activeDurationMs;
+      report.buyLastMarketPrice = buyMonitoring.lastMarketPrice;
+      report.buyDistanceToStop = buyMonitoring.distanceToStop;
+      report.buyLastTradeAgeSeconds = buyMonitoring.lastTradeAgeSeconds;
+      report.buyCancellationConfirmed = resolution.cancellationConfirmed;
+      printBuyTimeoutResult(error, resolution, activeDurationMs);
+      resolution.buyTimedOut = true;
+    }
     return resolution;
   }
 }
@@ -1377,6 +1655,32 @@ function printOperationReport(finalState) {
   status("Entry decision", report.entryDecision ?? "-");
   status("Arm reason", report.armReason ?? "-");
   status("Final BUY status", report.buyStatus ?? "-");
+  if (report.buyActiveDurationMs !== null) {
+    status(
+      "BUY active duration",
+      `${Math.round(report.buyActiveDurationMs / 1000)} seconds`,
+    );
+    status(
+      "Last market price",
+      report.buyLastMarketPrice?.toFixed(4) ?? "-",
+    );
+    status(
+      "Distance to stop",
+      Number.isFinite(report.buyDistanceToStop)
+        ? `${report.buyDistanceToStop >= 0 ? "+" : ""}${report.buyDistanceToStop.toFixed(2)}%`
+        : "-",
+    );
+    status(
+      "Last trade age",
+      Number.isFinite(report.buyLastTradeAgeSeconds)
+        ? `${report.buyLastTradeAgeSeconds} seconds`
+        : "-",
+    );
+    status(
+      "Cancellation",
+      report.buyCancellationConfirmed ? "CONFIRMED" : "NOT CONFIRMED",
+    );
+  }
   status("Bought quantity", report.boughtQuantity ?? "-");
   status(
     "Real buy average",
@@ -1472,7 +1776,11 @@ async function main() {
     "Initial observation interval",
     `${INITIAL_OBSERVATION_MS / 1000} seconds`,
   );
-  status("Entry window", `${ENTRY_WINDOW_MS / 60_000} minutes`);
+  status(
+    "Strategy total duration",
+    `${STRATEGY_TOTAL_DURATION_MINUTES} minutes`,
+  );
+  status("BUY active timeout", `${BUY_ACTIVE_TIMEOUT_MINUTES} minutes`);
   status("Position timeout", `${POSITION_TIMEOUT_MS / 1000} seconds`);
   status("Test exit mode", TEST_EXIT_MODE);
 
@@ -1485,7 +1793,9 @@ async function main() {
   if (!signalState) {
     await finishWithoutPosition(
       "NO ENTRY",
-      "Required opening/reference price was not available.",
+      MODE === "opening"
+        ? "No valid regular trade was available from 09:30 ET during the 1-minute capture window."
+        : "Required opening/reference price was not available.",
     );
     return;
   }
@@ -1522,11 +1832,13 @@ async function main() {
     );
   }
 
-  const buy = await executeBuy(setup, entryDeadlineMs);
+  const buy = await executeBuy(setup, signalState);
   if (buy.result === "NO BUY FILL") {
     await finishWithoutPosition(
-      "NO BUY FILL",
-      "BUY STOP-LIMIT ended without a position.",
+      buy.buyTimedOut ? "BUY TIMEOUT — NO FILL" : "NO BUY FILL",
+      buy.buyTimedOut
+        ? "BUY active period ended without a fill; cancellation and clean final state were confirmed."
+        : "BUY STOP-LIMIT ended without a position.",
     );
     return;
   }
