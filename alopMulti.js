@@ -4,11 +4,32 @@ const path = require("node:path");
 const ENV_FILE = ".env.local";
 const STREAM_URL = "wss://stream.data.alpaca.markets/v2/iex";
 const QUANTITY = 10;
-const SESSION_DURATION_MS = 60 * 1000;
+const TEST_SESSION_DURATION_MS = 60 * 1000;
+const REGULAR_OPEN_HOUR = 9;
+const REGULAR_OPEN_MINUTE = 30;
+const OPENING_SESSION_END_HOUR = 9;
+const OPENING_SESSION_END_MINUTE = 40;
 const PANEL_INTERVAL_MS = 500;
 const STEP_TIMEOUT_MS = 10 * 1000;
 const CLOSE_TIMEOUT_MS = 5 * 1000;
 const MAX_RECENT_EVENTS = 6;
+const OPENING_MODE = "TEST"; // "TEST" or "OPENING"
+const MARKET_TIME_ZONE = "America/New_York";
+const marketTimeFormatter = new Intl.DateTimeFormat("en-US", {
+  timeZone: MARKET_TIME_ZONE,
+  year: "numeric",
+  month: "2-digit",
+  day: "2-digit",
+  weekday: "short",
+  hour: "2-digit",
+  minute: "2-digit",
+  second: "2-digit",
+  hourCycle: "h23",
+});
+const marketOffsetFormatter = new Intl.DateTimeFormat("en-US", {
+  timeZone: MARKET_TIME_ZONE,
+  timeZoneName: "longOffset",
+});
 
 function createFailure(stage, message, details = {}) {
   const error = new Error(message);
@@ -82,6 +103,15 @@ function loadCredentials() {
   }
 }
 
+function validateOpeningMode() {
+  if (!["TEST", "OPENING"].includes(OPENING_MODE)) {
+    throw createFailure(
+      "CONFIGURATION",
+      `Invalid OPENING_MODE: ${OPENING_MODE}. Expected TEST or OPENING.`,
+    );
+  }
+}
+
 function localRunTimestamp(date = new Date()) {
   const pad = (value, length = 2) => String(value).padStart(length, "0");
   return (
@@ -137,6 +167,109 @@ function csvCell(value) {
   return `"${text.replaceAll('"', '""')}"`;
 }
 
+function marketTimeParts(timestampMs) {
+  return Object.fromEntries(
+    marketTimeFormatter
+      .formatToParts(new Date(timestampMs))
+      .filter((part) => part.type !== "literal")
+      .map((part) => [part.type, part.value]),
+  );
+}
+
+function marketSecondsSinceMidnight(parts) {
+  return (
+    Number(parts.hour) * 60 * 60 +
+    Number(parts.minute) * 60 +
+    Number(parts.second)
+  );
+}
+
+function isBeforeRegularOpen(timestampMs) {
+  const regularOpen =
+    REGULAR_OPEN_HOUR * 60 * 60 + REGULAR_OPEN_MINUTE * 60;
+  return marketSecondsSinceMidnight(marketTimeParts(timestampMs)) < regularOpen;
+}
+
+function marketClockTimestamp(timestampMs, hour, minute) {
+  const parts = marketTimeParts(timestampMs);
+  const offsetName = marketOffsetFormatter
+    .formatToParts(new Date(timestampMs))
+    .find((part) => part.type === "timeZoneName")?.value;
+  const offsetMatch = /^GMT([+-])(\d{2}):(\d{2})$/.exec(offsetName ?? "");
+  if (!offsetMatch) {
+    throw createFailure(
+      "CONFIGURATION",
+      `Could not determine ${MARKET_TIME_ZONE} UTC offset.`,
+    );
+  }
+
+  const offsetSign = offsetMatch[1] === "+" ? 1 : -1;
+  const offsetMinutes =
+    offsetSign * (Number(offsetMatch[2]) * 60 + Number(offsetMatch[3]));
+  return (
+    Date.UTC(
+      Number(parts.year),
+      Number(parts.month) - 1,
+      Number(parts.day),
+      hour,
+      minute,
+    ) -
+    offsetMinutes * 60 * 1000
+  );
+}
+
+function regularOpenTimestamp(timestampMs) {
+  return marketClockTimestamp(
+    timestampMs,
+    REGULAR_OPEN_HOUR,
+    REGULAR_OPEN_MINUTE,
+  );
+}
+
+function openingSessionEndTimestamp(timestampMs) {
+  return marketClockTimestamp(
+    timestampMs,
+    OPENING_SESSION_END_HOUR,
+    OPENING_SESSION_END_MINUTE,
+  );
+}
+
+function isRegularSessionTrade(timestampMs) {
+  const parts = marketTimeParts(timestampMs);
+  if (["Sat", "Sun"].includes(parts.weekday)) {
+    return false;
+  }
+
+  const secondsSinceMidnight = marketSecondsSinceMidnight(parts);
+  const regularOpen =
+    REGULAR_OPEN_HOUR * 60 * 60 + REGULAR_OPEN_MINUTE * 60;
+  const regularClose = 16 * 60 * 60;
+  return (
+    secondsSinceMidnight >= regularOpen &&
+    secondsSinceMidnight < regularClose
+  );
+}
+
+function acceptsOpeningTrade(
+  openingCanBeDetermined,
+  operationalSessionStarted,
+  timestampMs,
+) {
+  return (
+    OPENING_MODE === "TEST" ||
+    (openingCanBeDetermined &&
+      operationalSessionStarted &&
+      isRegularSessionTrade(timestampMs))
+  );
+}
+
+function formatDuration(durationMs) {
+  if (durationMs > 60 * 1000 && durationMs % (60 * 1000) === 0) {
+    return `${durationMs / (60 * 1000)}m`;
+  }
+  return `${durationMs / 1000}s`;
+}
+
 function closeWriteStream(stream) {
   return new Promise((resolve, reject) => {
     stream.once("finish", resolve);
@@ -152,7 +285,7 @@ async function closeRunLogs(logs) {
   ]);
 }
 
-function runMarketDataSession(symbols, logs) {
+function runMarketDataSession(symbols, logs, processStartedAt) {
   return new Promise((resolve, reject) => {
     const states = new Map(
       symbols.map((symbol) => [
@@ -164,6 +297,12 @@ function runMarketDataSession(symbols, logs) {
           tradeCount: 0,
           firstTimestamp: null,
           lastTimestamp: null,
+          openingPrice: null,
+          openingTimestamp: null,
+          lowestPrice: null,
+          lowestTimestamp: null,
+          drawdownPercent: null,
+          state: "WAITING_OPEN",
         },
       ]),
     );
@@ -172,6 +311,7 @@ function runMarketDataSession(symbols, logs) {
     let socket;
     let stage = "CONNECTING";
     let phaseTimer;
+    let marketOpenTimer;
     let sessionTimer;
     let panelTimer;
     let failure = null;
@@ -180,7 +320,16 @@ function runMarketDataSession(symbols, logs) {
     let sessionCompleted = false;
     let sessionStartedAt = null;
     let sessionEndedAt = null;
+    let operationalSessionEndsAt = null;
+    let sessionEndIsAnchored = false;
+    let operationalSessionDurationMs =
+      OPENING_MODE === "TEST"
+        ? TEST_SESSION_DURATION_MS
+        : openingSessionEndTimestamp(processStartedAt) -
+          regularOpenTimestamp(processStartedAt);
     let totalTrades = 0;
+    let openingCanBeDetermined = OPENING_MODE === "TEST";
+    let operationalSessionStarted = false;
 
     function elapsedSeconds() {
       if (sessionStartedAt === null) {
@@ -190,7 +339,17 @@ function runMarketDataSession(symbols, logs) {
       return (end - sessionStartedAt) / 1000;
     }
 
-    function recordEvent(message) {
+    function showEvent(message) {
+      const timestamp = new Date().toISOString();
+      const event = `[${timestamp}] ${message}`;
+      recentEvents.push(event);
+      if (recentEvents.length > MAX_RECENT_EVENTS) {
+        recentEvents.shift();
+      }
+      renderPanel();
+    }
+
+    function recordMarketEvent(message) {
       const timestamp = new Date().toISOString();
       const event = `[${timestamp}] ${message}`;
       recentEvents.push(event);
@@ -201,6 +360,10 @@ function runMarketDataSession(symbols, logs) {
       renderPanel();
     }
 
+    function recordOperationalEvent(message) {
+      recordMarketEvent(message);
+    }
+
     function renderPanel(force = false) {
       if (!process.stdout.isTTY && !force) {
         return;
@@ -209,20 +372,33 @@ function runMarketDataSession(symbols, logs) {
       const elapsed = elapsedSeconds();
       const lines = [
         "ALOP MULTI — ALPACA IEX",
-        `STATUS | ${stage} | ${elapsed.toFixed(1)}/${SESSION_DURATION_MS / 1000}s | ` +
+        `OPENING MODE | ${OPENING_MODE}`,
+        `STATUS | ${stage} | ${elapsed.toFixed(1)}/${formatDuration(operationalSessionDurationMs)} | ` +
           `Symbols ${symbols.length} | Trades ${totalTrades}`,
         "",
-        "SYMBOL   QTY   LAST PRICE     TRADES   LAST TRADE",
+        "SYMBOL   QTY   LAST         OPENING      LOW          DD%      STATE          TRADES   OPENING TRADE                    LAST TRADE",
       ];
 
       for (const state of states.values()) {
         const price =
           state.lastPrice === null ? "-" : state.lastPrice.toFixed(4);
+        const opening =
+          state.openingPrice === null ? "-" : state.openingPrice.toFixed(4);
+        const low =
+          state.lowestPrice === null ? "-" : state.lowestPrice.toFixed(4);
+        const drawdown =
+          state.drawdownPercent === null
+            ? "-"
+            : state.drawdownPercent.toFixed(2);
         const lastTrade =
           state.lastTimestamp === null ? "-" : state.lastTimestamp;
+        const openingTrade =
+          state.openingTimestamp === null ? "-" : state.openingTimestamp;
         lines.push(
           `${state.symbol.padEnd(8)} ${String(state.quantity).padEnd(5)} ` +
-            `${price.padEnd(14)} ${String(state.tradeCount).padEnd(8)} ${lastTrade}`,
+            `${price.padEnd(12)} ${opening.padEnd(12)} ${low.padEnd(12)} ` +
+            `${drawdown.padEnd(8)} ${state.state.padEnd(14)} ` +
+            `${String(state.tradeCount).padEnd(8)} ${openingTrade.padEnd(32)} ${lastTrade}`,
         );
       }
 
@@ -244,7 +420,72 @@ function runMarketDataSession(symbols, logs) {
 
     function clearTimers() {
       clearTimeout(phaseTimer);
+      clearTimeout(marketOpenTimer);
       clearTimeout(sessionTimer);
+    }
+
+    function completeOperationalSession() {
+      sessionEndedAt = sessionEndIsAnchored
+        ? operationalSessionEndsAt
+        : Date.now();
+      sessionCompleted = true;
+      stage = "CLOSING";
+      stopPanel();
+      showEvent(
+        OPENING_MODE === "TEST"
+          ? "60-second session completed"
+          : "Operational session completed",
+      );
+      localCloseRequested = true;
+      socket.close(1000, "trade session complete");
+      phaseTimer = setTimeout(
+        () =>
+          fail(
+            createFailure(
+              "CLOSING",
+              `Close timed out after ${CLOSE_TIMEOUT_MS} ms.`,
+            ),
+          ),
+        CLOSE_TIMEOUT_MS,
+      );
+    }
+
+    function startOperationalSession(
+      startedAt,
+      sessionEndsAt,
+      marketOpen = false,
+    ) {
+      sessionStartedAt = startedAt;
+      operationalSessionStarted = true;
+      operationalSessionEndsAt = sessionEndsAt;
+      operationalSessionDurationMs = sessionEndsAt - startedAt;
+      sessionEndIsAnchored = marketOpen;
+      stage = "RECEIVING TRADES";
+      if (marketOpen) {
+        recordOperationalEvent("MARKET OPEN");
+        recordOperationalEvent("Operational session started");
+      } else {
+        showEvent("60-second session started");
+      }
+
+      sessionTimer = setTimeout(
+        completeOperationalSession,
+        Math.max(0, operationalSessionEndsAt - Date.now()),
+      );
+    }
+
+    function waitForMarketOpen(marketOpensAt, sessionEndsAt) {
+      const remainingMs = marketOpensAt - Date.now();
+      if (remainingMs > 0) {
+        marketOpenTimer = setTimeout(
+          () => waitForMarketOpen(marketOpensAt, sessionEndsAt),
+          remainingMs,
+        );
+        return;
+      }
+
+      marketOpenTimer = undefined;
+      startOperationalSession(marketOpensAt, sessionEndsAt, true);
     }
 
     function settle(error = null) {
@@ -261,6 +502,7 @@ function runMarketDataSession(symbols, logs) {
           states,
           totalTrades,
           durationSeconds: elapsedSeconds(),
+          operationalSessionDurationMs,
           closeCode: null,
           closeReason: "",
         });
@@ -282,7 +524,7 @@ function runMarketDataSession(symbols, logs) {
       }
       failure = error;
       stage = error.stage;
-      recordEvent(`FAILURE | ${error.stage} | ${error.message}`);
+      showEvent(`FAILURE | ${error.stage} | ${error.message}`);
       clearTimers();
       stopPanel();
 
@@ -338,7 +580,7 @@ function runMarketDataSession(symbols, logs) {
         message.T === "success" &&
         message.msg === "connected"
       ) {
-        recordEvent('Alpaca connection confirmed: "connected"');
+        showEvent('Alpaca connection confirmed: "connected"');
         stage = "WAITING FOR AUTHENTICATED";
         socket.send(
           JSON.stringify({
@@ -347,7 +589,7 @@ function runMarketDataSession(symbols, logs) {
             secret: process.env.ALPACA_API_SECRET_KEY,
           }),
         );
-        recordEvent("Authentication requested");
+        showEvent("Authentication requested");
         waitForStep(stage);
         return;
       }
@@ -357,7 +599,7 @@ function runMarketDataSession(symbols, logs) {
         message.T === "success" &&
         message.msg === "authenticated"
       ) {
-        recordEvent('Authentication confirmed: "authenticated"');
+        showEvent('Authentication confirmed: "authenticated"');
         stage = "WAITING FOR SUBSCRIPTION";
         socket.send(
           JSON.stringify({
@@ -365,7 +607,7 @@ function runMarketDataSession(symbols, logs) {
             trades: symbols,
           }),
         );
-        recordEvent(`Trades subscription requested: ${symbols.join(", ")}`);
+        showEvent(`Trades subscription requested: ${symbols.join(", ")}`);
         waitForStep(stage);
         return;
       }
@@ -392,34 +634,46 @@ function runMarketDataSession(symbols, logs) {
         }
 
         clearTimeout(phaseTimer);
-        recordEvent(`Trades subscription confirmed: ${symbols.join(", ")}`);
-        stage = "RECEIVING TRADES";
-        sessionStartedAt = Date.now();
-        recordEvent("60-second session started");
+        showEvent(`Trades subscription confirmed: ${symbols.join(", ")}`);
+        openingCanBeDetermined =
+          OPENING_MODE === "TEST" || isBeforeRegularOpen(processStartedAt);
         panelTimer = setInterval(renderPanel, PANEL_INTERVAL_MS);
-        sessionTimer = setTimeout(() => {
-          sessionEndedAt = Date.now();
-          sessionCompleted = true;
-          stage = "CLOSING";
-          stopPanel();
-          recordEvent("60-second session completed");
-          localCloseRequested = true;
-          socket.close(1000, "trade session complete");
-          phaseTimer = setTimeout(
-            () =>
-              fail(
-                createFailure(
-                  "CLOSING",
-                  `Close timed out after ${CLOSE_TIMEOUT_MS} ms.`,
-                ),
-              ),
-            CLOSE_TIMEOUT_MS,
+
+        if (OPENING_MODE === "TEST") {
+          const startedAt = Date.now();
+          startOperationalSession(
+            startedAt,
+            startedAt + TEST_SESSION_DURATION_MS,
           );
-        }, SESSION_DURATION_MS);
+          return;
+        }
+
+        if (!openingCanBeDetermined) {
+          showEvent(
+            "OPENING unavailable: process started at or after 09:30 ET; " +
+              "symbols will remain in WAITING_OPEN",
+          );
+          const startedAt = Date.now();
+          startOperationalSession(
+            startedAt,
+            startedAt + TEST_SESSION_DURATION_MS,
+          );
+          return;
+        }
+
+        stage = "WAITING FOR MARKET OPEN";
+        recordOperationalEvent("WAITING FOR MARKET OPEN");
+        waitForMarketOpen(
+          regularOpenTimestamp(processStartedAt),
+          openingSessionEndTimestamp(processStartedAt),
+        );
         return;
       }
 
-      if (stage === "RECEIVING TRADES" && message.T === "t") {
+      if (
+        ["WAITING FOR MARKET OPEN", "RECEIVING TRADES"].includes(stage) &&
+        message.T === "t"
+      ) {
         const state = states.get(message.S);
         const timestampMs =
           typeof message.t === "string" ? Date.parse(message.t) : NaN;
@@ -445,6 +699,42 @@ function runMarketDataSession(symbols, logs) {
         state.lastTimestamp = message.t;
         totalTrades += 1;
         writeTrade(message);
+
+        if (state.state === "WAITING_OPEN") {
+          if (
+            !acceptsOpeningTrade(
+              openingCanBeDetermined,
+              operationalSessionStarted,
+              timestampMs,
+            )
+          ) {
+            return;
+          }
+
+          state.openingPrice = message.p;
+          state.openingTimestamp = message.t;
+          state.lowestPrice = message.p;
+          state.lowestTimestamp = message.t;
+          state.drawdownPercent = 0;
+          state.state = "TRACKING";
+          recordMarketEvent(
+            `${state.symbol} | OPENING PRICE | MODE ${OPENING_MODE} | ` +
+              `${message.p} | ${message.t}`,
+          );
+          return;
+        }
+
+        if (message.p < state.lowestPrice) {
+          state.lowestPrice = message.p;
+          state.lowestTimestamp = message.t;
+          state.drawdownPercent =
+            ((state.lowestPrice - state.openingPrice) / state.openingPrice) *
+            100;
+          recordMarketEvent(
+            `${state.symbol} | NEW LOW | ${message.p} | ${message.t} | ` +
+              `DD ${state.drawdownPercent.toFixed(2)}%`,
+          );
+        }
         return;
       }
 
@@ -477,8 +767,8 @@ function runMarketDataSession(symbols, logs) {
       return;
     }
 
-    recordEvent(`Symbols validated: ${symbols.join(", ")}`);
-    recordEvent(`Run directory created: ${logs.runDirectory}`);
+    showEvent(`Symbols validated: ${symbols.join(", ")}`);
+    showEvent(`Run directory created: ${logs.runDirectory}`);
     renderPanel(true);
 
     try {
@@ -496,7 +786,7 @@ function runMarketDataSession(symbols, logs) {
 
     socket.addEventListener("open", () => {
       stage = "WAITING FOR CONNECTED";
-      recordEvent("WebSocket transport opened");
+      showEvent("WebSocket transport opened");
     });
 
     socket.addEventListener("message", (event) => {
@@ -540,7 +830,7 @@ function runMarketDataSession(symbols, logs) {
 
     socket.addEventListener("close", (event) => {
       clearTimeout(phaseTimer);
-      recordEvent(
+      showEvent(
         `WebSocket closed: ${event.code} / ${event.reason || "no reason"}`,
       );
       stopPanel();
@@ -576,23 +866,46 @@ function runMarketDataSession(symbols, logs) {
 function printSummary(result, logs) {
   console.log();
   console.log("SESSION SUMMARY");
+  console.log(`Opening mode: ${OPENING_MODE}`);
+  console.log(
+    `Configured operational duration: ${formatDuration(result.operationalSessionDurationMs)}`,
+  );
   for (const state of result.states.values()) {
-    console.log(`${state.symbol}: ${state.tradeCount} trades`);
+    const opening =
+      state.openingPrice === null ? "-" : state.openingPrice.toFixed(4);
+    const low =
+      state.lowestPrice === null ? "-" : state.lowestPrice.toFixed(4);
+    const drawdown =
+      state.drawdownPercent === null
+        ? "-"
+        : `${state.drawdownPercent.toFixed(2)}%`;
+    console.log(
+      `${state.symbol}: ${state.tradeCount} trades | Opening ${opening} | ` +
+        `Low ${low} | DD ${drawdown} | ${state.state}`,
+    );
   }
   console.log(`Total trades: ${result.totalTrades}`);
-  console.log(`Session duration: ${result.durationSeconds.toFixed(3)} seconds`);
+  console.log(
+    `Actual operational duration: ${result.durationSeconds.toFixed(3)} seconds`,
+  );
   console.log(`events.log: ${logs.eventsPath}`);
   console.log(`prices.csv: ${logs.pricesPath}`);
   console.log("Result: SUCCESS");
 }
 
 async function main() {
+  const processStartedAt = Date.now();
+  validateOpeningMode();
   const symbols = readSymbols();
   loadCredentials();
   const logs = await createRunLogs();
 
   try {
-    const result = await runMarketDataSession(symbols, logs);
+    const result = await runMarketDataSession(
+      symbols,
+      logs,
+      processStartedAt,
+    );
     printSummary(result, logs);
   } catch (error) {
     console.error("Result: FAILURE");
